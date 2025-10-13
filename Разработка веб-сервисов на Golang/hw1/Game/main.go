@@ -6,11 +6,15 @@ import (
 	"strings"
 )
 
-// Player представляет игрока
-type Player struct {
-	room        *Room
-	inventory   map[string]bool
-	hasBackpack bool
+// --- Типы модели мира ---
+
+// Path моделирует путь (выход) из комнаты
+type Path struct {
+	to         *Room
+	locked     bool
+	unlockItem string // предмет, которым можно открыть (например "ключи")
+	lockMsg    string // сообщение если путь заблокирован
+	unlockMsg  string // сообщение при успешном открытии
 }
 
 // Room представляет комнату
@@ -18,102 +22,117 @@ type Room struct {
 	name        string
 	description string
 	items       map[string]bool
-	paths       map[string]*Room
-	lookFunc    func() string
-	useFunc     func(string, string) string // Изменена сигнатура для поддержки цели
+	paths       map[string]*Path
+
+	// Опциональные хуки:
+	lookFunc    func(w *World, r *Room) string
+	useFunc     func(w *World, r *Room, item, target string) string // сначала пробуем этот хук
+	// onEnterFunc func(w *World, from *Room) string                  // вызывается при входе
+}
+
+// Player представляет игрока
+type Player struct {
+	room        *Room
+	inventory   map[string]bool
+	hasBackpack bool
 }
 
 // World представляет игровой мир
 type World struct {
-	rooms      map[string]*Room
-	player     *Player
-	doorLocked bool
+	rooms map[string]*Room
+	player *Player
 }
+
+// --- Инициализация игры ---
 
 var world *World
 
+const NothingNeed = "ничего не требуется"
+const NothingUse = "не к чему применить"
+
+
 func initGame() {
 	world = &World{
-		rooms:      make(map[string]*Room),
-		doorLocked: true,
+		rooms: make(map[string]*Room),
 	}
 
-	// Создаем комнаты
+	// --- Создаем комнаты ---
 	kitchen := &Room{
 		name:        "кухня",
 		description: "кухня, ничего интересного",
 		items:       make(map[string]bool),
-		paths:       make(map[string]*Room),
+		paths:       make(map[string]*Path),
 	}
 
 	corridor := &Room{
 		name:        "коридор",
 		description: "ничего интересного",
 		items:       make(map[string]bool),
-		paths:       make(map[string]*Room),
+		paths:       make(map[string]*Path),
 	}
 
 	room := &Room{
 		name:        "комната",
 		description: "ты в своей комнате",
 		items:       make(map[string]bool),
-		paths:       make(map[string]*Room),
+		paths:       make(map[string]*Path),
 	}
 
 	street := &Room{
 		name:        "улица",
 		description: "на улице весна",
 		items:       make(map[string]bool),
-		paths:       make(map[string]*Room),
+		paths:       make(map[string]*Path),
 	}
 
-	// Добавляем предметы в комнаты
+	// --- Предметы ---
 	kitchen.items["чай"] = true
 	room.items["ключи"] = true
 	room.items["конспекты"] = true
 	room.items["рюкзак"] = true
 
-	// Настраиваем пути
-	kitchen.paths["коридор"] = corridor
+	// --- Пути (используем Path, указываем locked для двери) ---
+	kitchen.paths["коридор"] = &Path{to: corridor}
+	// путь на улицу заблокирован — его можно открыть "ключи"
 
-	corridor.paths["кухня"] = kitchen
-	corridor.paths["комната"] = room
-	corridor.paths["улица"] = street
+	corridor.paths["кухня"] = &Path{to: kitchen}
+	corridor.paths["комната"] = &Path{to: room}
+	corridor.paths["улица"] = &Path{
+		to:         street,
+		locked:     true,
+		unlockItem: "ключи",
+		lockMsg:    "дверь закрыта",
+		unlockMsg:  "дверь открыта",
+	}
 
-	room.paths["коридор"] = corridor
+	room.paths["коридор"] = &Path{to: corridor}
+	street.paths["домой"] = &Path{to: corridor}
 
-	street.paths["домой"] = corridor
-
-	// Специальные функции для комнат
-	kitchen.lookFunc = func() string {
-		items := getRoomItems(kitchen)
-		paths := getRoomPaths(kitchen)
-
-		if !world.player.hasBackpack {
+	// --- Хуки lookFunc для детерминированного описания ---
+	kitchen.lookFunc = func(w *World, r *Room) string {
+		items := getRoomItems(r)
+		paths := getRoomPaths(r)
+		if !w.player.hasBackpack {
 			return fmt.Sprintf("ты находишься на кухне, на столе: %s, надо собрать рюкзак и идти в универ. можно пройти - %s", items, paths)
 		}
 		return fmt.Sprintf("ты находишься на кухне, на столе: %s, надо идти в универ. можно пройти - %s", items, paths)
 	}
 
-	room.lookFunc = func() string {
-		if len(room.items) == 0 {
+	room.lookFunc = func(w *World, r *Room) string {
+		// как в вашем коде: рюкзак отдельно на стуле
+		if len(r.items) == 0 {
 			return "пустая комната. можно пройти - коридор"
 		}
-
 		tableItems := []string{}
 		hasBackpack := false
-
-		for item := range room.items {
+		for item := range r.items {
 			if item == "рюкзак" {
 				hasBackpack = true
 			} else {
 				tableItems = append(tableItems, item)
 			}
 		}
-
-		// ИСПРАВЛЕНИЕ: Добавлена сортировка предметов на столе для консистентного вывода
 		sort.Strings(tableItems)
-
 		result := "на столе: " + strings.Join(tableItems, ", ")
 		if hasBackpack {
 			if len(tableItems) > 0 {
@@ -122,34 +141,41 @@ func initGame() {
 			result += "на стуле: рюкзак"
 		}
 		result += ". можно пройти - коридор"
-
 		return result
 	}
 
-	corridor.lookFunc = func() string {
-		return fmt.Sprintf("ничего интересного. можно пройти - %s", getRoomPaths(corridor))
+	corridor.lookFunc = func(w *World, r *Room) string {
+		return fmt.Sprintf("ничего интересного. можно пройти - %s", getRoomPaths(r))
 	}
 
-	street.lookFunc = func() string {
-		return fmt.Sprintf("на улице весна. можно пройти - %s", getRoomPaths(street))
+	street.lookFunc = func(w *World, r *Room) string {
+		return fmt.Sprintf("на улице весна. можно пройти - %s", getRoomPaths(r))
 	}
 
-	// ИСПРАВЛЕНИЕ: Функция теперь принимает и обрабатывает цель (target)
-	corridor.useFunc = func(item, target string) string {
-		if item == "ключи" && target == "дверь" && world.doorLocked {
-			world.doorLocked = false
-			return "дверь открыта"
+	// --- useFunc для коридора: пытается открыть заблокированные пути если item совпадает с unlockItem ---
+	corridor.useFunc = func(w *World, r *Room, item, target string) string {
+		// пробуем сначала стандартное: если цель совпадает с именем пути — пытаемся открыть
+		if p, ok := r.paths[target]; ok {
+			if !p.locked {
+				return NothingNeed 
+
+			}
+			if item == p.unlockItem {
+				p.locked = false
+				return p.unlockMsg
+			}
+			return "не сработало"
 		}
-		return "не к чему применить"
+		return NothingUse
 	}
 
-	// Добавляем комнаты в мир
+	// --- Добавляем комнаты в мир ---
 	world.rooms["кухня"] = kitchen
 	world.rooms["коридор"] = corridor
 	world.rooms["комната"] = room
 	world.rooms["улица"] = street
 
-	// Создаем игрока
+	// --- Создаём игрока ---
 	world.player = &Player{
 		room:        kitchen,
 		inventory:   make(map[string]bool),
@@ -157,150 +183,220 @@ func initGame() {
 	}
 }
 
-// Вспомогательные функции
-func getRoomItems(room *Room) string {
+// --- Вспомогательные функции для вывода ---
+
+func getRoomItems(r *Room) string {
 	items := []string{}
-	for item := range room.items {
-		items = append(items, item)
+	for it := range r.items {
+		items = append(items, it)
 	}
 	sort.Strings(items)
+	if len(items) == 0 {
+		return "ничего"
+	}
 	return strings.Join(items, ", ")
 }
 
-func getRoomPaths(room *Room) string {
-	paths := []string{}
-	for path := range room.paths {
-		paths = append(paths, path)
+// func getRoomPaths(r *Room) string {
+// 	paths := []string{}
+// 	for name := range r.paths {
+// 		paths = append(paths, name)
+// 	}
+// 	return strings.Join(paths, ", ")
+// }
+
+func getRoomPaths(r *Room) string {
+	names := make([]string, 0, len(r.paths))
+	for name := range r.paths {
+		names = append(names, name)
 	}
-	return strings.Join(paths, ", ")
+
+	// --- Кастомная сортировка ---
+	sort.Slice(names, func(i, j int) bool {
+		a := []rune(names[i])
+		b := []rune(names[j])
+
+		// если первые буквы разные — сортируем по алфавиту
+		if a[0] != b[0] {
+			return a[0] < b[0]
+		}
+
+		// если первые совпали — остальные в обратном порядке
+		for k := 1; k < len(a) && k < len(b); k++ {
+			if a[k] != b[k] {
+				return a[k] > b[k]
+			}
+		}
+
+		// если одно слово — префикс другого
+		return len(a) < len(b)
+	})
+
+	return strings.Join(names, ", ")
 }
+
+
+
+
+// --- Обработчики команд (делегирующие) ---
 
 const UnknownCommandMsg = "неизвестная команда"
 
 func handleCommand(command string) string {
-	parts := strings.Fields(command) // Используем Fields для лучшей обработки пробелов
+	parts := strings.Fields(command)
 	if len(parts) == 0 {
 		return UnknownCommandMsg
 	}
-
 	cmd := parts[0]
+	args := parts[1:]
 
 	switch cmd {
 	case "осмотреться":
 		return handleLook()
 	case "идти":
-		if len(parts) < 2 {
+		if len(args) < 1 {
 			return "куда идти?"
 		}
-		return handleGo(parts[1])
+		return handleGo(args[0])
 	case "взять":
-		if len(parts) < 2 {
+		if len(args) < 1 {
 			return "что взять?"
 		}
-		return handleTake(parts[1])
+		return handleTake(args[0])
 	case "надеть":
-		if len(parts) < 2 {
+		if len(args) < 1 {
 			return "что надеть?"
 		}
-		return handleWear(parts[1])
+		return handleWear(args[0])
 	case "применить":
-		if len(parts) < 3 {
-			return "что и к чему применить?" // Уточнено сообщение
+		if len(args) < 2 {
+			return "что и к чему применить?"
 		}
-		return handleUse(parts[1], parts[2])
+		return handleUse(args[0], args[1])
 	default:
-		return "неизвестная команда"
+		return UnknownCommandMsg
 	}
 }
 
 func handleLook() string {
-	room := world.player.room
-
-	if room.lookFunc != nil {
-		return room.lookFunc()
+	r := world.player.room
+	if r.lookFunc != nil {
+		return r.lookFunc(world, r)
 	}
-
-	return fmt.Sprintf("%s. можно пройти - %s", room.description, getRoomPaths(room))
+	// дефолтное описание
+	return fmt.Sprintf("%s. можно пройти - %s", r.description, getRoomPaths(r))
 }
 
 func handleGo(direction string) string {
-	targetRoom, exists := world.player.room.paths[direction]
+	cur := world.player.room
+	p, exists := cur.paths[direction]
 	if !exists {
 		return "нет пути в " + direction
 	}
-
-	// Проверка на заблокированную дверь
-	if world.player.room == world.rooms["коридор"] && direction == "улица" && world.doorLocked {
-		return "дверь закрыта"
+	if p.locked {
+		if p.lockMsg != "" {
+			return p.lockMsg
+		}
+		return "путь заблокирован"
 	}
 
-	world.player.room = targetRoom
+	world.player.room = p.to
 
-	// Для комнаты при переходе показываем базовое описание
-	if targetRoom.name == "комната" {
+	// --- Особые случаи ---
+	if world.player.room.name == "комната" {
 		return "ты в своей комнате. можно пройти - коридор"
 	}
-
-	// Для кухни при переходе показываем базовое описание
-	if targetRoom.name == "кухня" {
+	if world.player.room.name == "кухня" {
 		return "кухня, ничего интересного. можно пройти - коридор"
 	}
 
-	// Вызываем lookFunc, чтобы получить полное описание с правильной сортировкой
-	if targetRoom.lookFunc != nil {
-		return targetRoom.lookFunc()
+	// --- Общий случай ---
+	if world.player.room.lookFunc != nil {
+		return world.player.room.lookFunc(world, world.player.room)
 	}
-
-	return fmt.Sprintf("%s. можно пройти - %s", targetRoom.description, getRoomPaths(targetRoom))
+	return fmt.Sprintf("%s. можно пройти - %s", world.player.room.description, getRoomPaths(world.player.room))
 }
+
+
 
 func handleTake(item string) string {
 	if !world.player.hasBackpack {
 		return "некуда класть"
 	}
-
-	_, exists := world.player.room.items[item]
-	if !exists {
+	cur := world.player.room
+	if _, ok := cur.items[item]; !ok {
 		return "нет такого"
 	}
-
-	delete(world.player.room.items, item)
+	delete(cur.items, item)
 	world.player.inventory[item] = true
 	return "предмет добавлен в инвентарь: " + item
 }
 
 func handleWear(item string) string {
+	// только рюкзак можно надеть (по логике игры)
 	if item != "рюкзак" {
 		return "неизвестная команда"
 	}
-
-	_, exists := world.player.room.items[item]
-	if !exists {
+	cur := world.player.room
+	if _, exists := cur.items[item]; !exists {
 		return "нет такого"
 	}
-
-	delete(world.player.room.items, item)
+	delete(cur.items, item)
 	world.player.hasBackpack = true
 	return "вы надели: " + item
 }
 
 func handleUse(item, target string) string {
-	_, hasItem := world.player.inventory[item]
-	if !hasItem {
+	// проверяем инвентарь
+	if _, ok := world.player.inventory[item]; !ok {
 		return "нет предмета в инвентаре - " + item
 	}
-	// ИСПРАВЛЕНИЕ: Передаем в useFunc и предмет, и цель
-	if world.player.room.useFunc != nil {
-		return world.player.room.useFunc(item, target)
+	r := world.player.room
+
+	// сначала локальный useFunc комнаты
+	if r.useFunc != nil {
+		res := r.useFunc(world, r, item, target)
+		if res != NothingUse && res != "не сработало" && res != NothingNeed {
+			return res
+		}
+		if res == NothingNeed {
+			return res
+		}
 	}
 
-	return "не к чему применить"
+	// прямое применение к пути
+	if p, ok := r.paths[target]; ok {
+		if !p.locked {
+			return NothingNeed
+		}
+		if item == p.unlockItem {
+			p.locked = false
+			if p.unlockMsg != "" {
+				return p.unlockMsg
+			}
+			return "открыто"
+		}
+		return NothingUse
+	}
+
+	// если цель "дверь" — ищем путь с locked == true
+	if target == "дверь" {
+		for _, p := range r.paths {
+			if p.locked && item == p.unlockItem {
+				p.locked = false
+				if p.unlockMsg != "" {
+					return p.unlockMsg
+				}
+				return "открыто"
+			}
+		}
+	}
+
+	return NothingUse
 }
 
+
+// --- Простой REPL (удалите/измените для тестов) ---
 func main() {
-	/*
-		в этой функции можно ничего не писать,
-		но тогда у вас не будет работать через go run main.go
-		очень круто будет сделать построчный ввод команд тут, хотя это и не требуется по заданию
-	*/
+	
 }
